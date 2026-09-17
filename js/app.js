@@ -1205,6 +1205,7 @@ async function onReturnByRequestSave() {
 // ISSUE / SCAN
 // ============================================================================
 function resetScanView() {
+  teardownCountMode();
   document.getElementById('scan-step-camera').hidden = false;
   document.getElementById('scan-step-issue').hidden = true;
   document.getElementById('scan-step-issue').innerHTML = '';
@@ -1219,6 +1220,79 @@ function resetScanView() {
   }, () => {
     status.textContent = t('scanHintNotRecognized');
   });
+}
+
+// ----------------------------------------------------------------------------
+// SCAN-TO-COUNT — an alternative to typing a received quantity: the camera
+// stays live and every further scan of the SAME item's QR counts as "+1
+// unit", for someone physically placing items on the shelf one at a time.
+// Nothing is written to the database until "Confirm", so "Undo" is just
+// decrementing a local counter — walking away mid-count leaves no partial
+// transaction behind, and a failed confirm can safely resume counting.
+// Reuses the single #scan-video/#scan-canvas pair (re-parenting the visible
+// `.scan-frame` into whichever panel needs it) rather than opening a second
+// camera stream, since QR.startScanner() doesn't stop a stream it didn't
+// start itself.
+// ----------------------------------------------------------------------------
+let countState = null; // { count } while receive count-mode is active, else null
+
+function moveCameraInto(slotEl) {
+  const frame = document.querySelector('.scan-frame');
+  if (frame) slotEl.appendChild(frame);
+}
+
+function restoreCameraHome() {
+  const stepCamera = document.getElementById('scan-step-camera');
+  const canvas = document.getElementById('scan-canvas');
+  const frame = document.querySelector('.scan-frame');
+  if (stepCamera && frame && frame.parentElement !== stepCamera) {
+    stepCamera.insertBefore(frame, canvas);
+  }
+}
+
+function stopCountScanner() {
+  QR.stopScanner(document.getElementById('scan-video'));
+}
+
+function startCountScanner(sku) {
+  const video = document.getElementById('scan-video');
+  const canvas = document.getElementById('scan-canvas');
+  const status = document.getElementById('scan-rc-count-status');
+  QR.startScanner(video, canvas, (code) => onCountScan(code, sku), () => {
+    if (status) status.textContent = t('scanHintNoCamera');
+  }, () => {
+    if (status) status.textContent = t('scanHintNotRecognized');
+  });
+}
+
+function onCountScan(code, sku) {
+  if (!countState) return; // count mode was cancelled while a detect was in flight
+  if (code !== sku.sku_code) {
+    toast(t('toastWrongItemScanned', code), 'error');
+    startCountScanner(sku);
+    return;
+  }
+  countState.count += 1;
+  try { navigator.vibrate && navigator.vibrate(60); } catch (_) {}
+  renderCountDisplay(sku);
+  startCountScanner(sku); // onDetect ends the loop; keep listening for the next unit
+}
+
+function renderCountDisplay(sku) {
+  const display = document.getElementById('scan-rc-count-display');
+  if (display) display.textContent = t('labelScanCount', countState.count, sku.base_uom);
+  const undoBtn = document.getElementById('btn-rc-count-undo');
+  if (undoBtn) undoBtn.disabled = countState.count === 0;
+  const confirmBtn = document.getElementById('btn-confirm-scan-count');
+  if (confirmBtn) confirmBtn.disabled = countState.count === 0;
+}
+
+function teardownCountMode() {
+  if (countState) {
+    stopCountScanner();
+    restoreCameraHome();
+    countState = null;
+  }
 }
 
 document.getElementById('btn-lookup-lot').addEventListener('click', () => {
@@ -1313,25 +1387,48 @@ function renderScannedItem(sku, openRequests, preferredAction = null) {
     </div>
 
     <div id="scan-action-receive" ${defaultAction === 'receive' ? '' : 'hidden'}>
-      <div class="field" style="margin-top:var(--s4)">
-        <label for="scan-rc-qty">${t('fieldQtyReceived')}</label>
-        <input type="number" id="scan-rc-qty" min="0.0001" step="any" value="1">
+      <div class="segmented" id="rc-mode-tabs" role="tablist" style="margin-top:var(--s4)">
+        <button data-mode="manual" aria-pressed="true" data-icon="pencil"><span>${t('scanModeManual')}</span></button>
+        <button data-mode="count" aria-pressed="false" data-icon="qr"><span>${t('scanModeCount')}</span></button>
       </div>
-      <div class="field">
-        <label for="scan-rc-uom">${t('fieldUnit')}</label>
-        <input type="text" id="scan-rc-uom" value="${escapeHtml(sku.base_uom)}">
+
+      <div id="scan-rc-manual">
+        <div class="field" style="margin-top:var(--s4)">
+          <label for="scan-rc-qty">${t('fieldQtyReceived')}</label>
+          <input type="number" id="scan-rc-qty" min="0.0001" step="any" value="1">
+        </div>
+        <div class="field">
+          <label for="scan-rc-uom">${t('fieldUnit')}</label>
+          <input type="text" id="scan-rc-uom" value="${escapeHtml(sku.base_uom)}">
+        </div>
+        <div class="field">
+          <label for="scan-rc-by">${t('fieldReceivedBy')}</label>
+          <input type="text" id="scan-rc-by" placeholder="${escapeHtml(t('fieldReceivedByPh'))}">
+        </div>
+        <div class="field">
+          <label for="scan-rc-photos">${t('fieldEvidencePhotos')}</label>
+          <input type="file" id="scan-rc-photos" accept="image/*" multiple>
+          <div class="evidence-thumbs" id="scan-rc-photos-preview"></div>
+        </div>
+        <div id="scan-rc-error"></div>
+        <button class="btn btn-primary btn-block" id="btn-confirm-scan-receive">${icon('plusCircle', 16)}<span id="scan-rc-confirm-label">${t('btnConfirmReceive')}</span></button>
       </div>
-      <div class="field">
-        <label for="scan-rc-by">${t('fieldReceivedBy')}</label>
-        <input type="text" id="scan-rc-by" placeholder="${escapeHtml(t('fieldReceivedByPh'))}">
+
+      <div id="scan-rc-count" hidden>
+        <div class="field" style="margin-top:var(--s4)">
+          <label for="scan-rc-count-by">${t('fieldReceivedBy')}</label>
+          <input type="text" id="scan-rc-count-by" placeholder="${escapeHtml(t('fieldReceivedByPh'))}">
+        </div>
+        <div id="scan-rc-count-camera-slot"></div>
+        <p class="scan-note" id="scan-rc-count-status">${t('hintCountMode')}</p>
+        <div class="stat-figure" id="scan-rc-count-display" style="font-size:var(--t-card); margin-top:var(--s3)">${t('labelScanCount', 0, sku.base_uom)}</div>
+        <div class="card-row" style="margin-top:var(--s3); gap:var(--s3)">
+          <button class="btn btn-outline" id="btn-rc-count-undo" disabled>${t('btnUndoLastScan')}</button>
+          <button class="btn btn-ghost" id="btn-rc-count-cancel">${t('btnCancelCount')}</button>
+        </div>
+        <div id="scan-rc-count-error" style="margin-top:var(--s3)"></div>
+        <button class="btn btn-primary btn-block" id="btn-confirm-scan-count" style="margin-top:var(--s3)" disabled>${icon('plusCircle', 16)}<span id="scan-rc-count-confirm-label">${t('btnConfirmReceive')}</span></button>
       </div>
-      <div class="field">
-        <label for="scan-rc-photos">${t('fieldEvidencePhotos')}</label>
-        <input type="file" id="scan-rc-photos" accept="image/*" multiple>
-        <div class="evidence-thumbs" id="scan-rc-photos-preview"></div>
-      </div>
-      <div id="scan-rc-error"></div>
-      <button class="btn btn-primary btn-block" id="btn-confirm-scan-receive">${icon('plusCircle', 16)}<span id="scan-rc-confirm-label">${t('btnConfirmReceive')}</span></button>
     </div>
 
     <button class="btn btn-ghost btn-block" id="btn-scan-again" style="margin-top:var(--s4)">${icon('repeat', 16)}<span>${t('btnScanDifferent')}</span></button>
@@ -1346,7 +1443,63 @@ function renderScannedItem(sku, openRequests, preferredAction = null) {
       document.querySelectorAll('#scan-action-tabs button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
       document.getElementById('scan-action-issue').hidden = b.dataset.action !== 'issue';
       document.getElementById('scan-action-receive').hidden = b.dataset.action !== 'receive';
+      if (b.dataset.action !== 'receive') teardownCountMode();
     });
+  });
+
+  document.querySelectorAll('#rc-mode-tabs button').forEach((b) => {
+    b.addEventListener('click', () => {
+      document.querySelectorAll('#rc-mode-tabs button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      const mode = b.dataset.mode;
+      document.getElementById('scan-rc-manual').hidden = mode !== 'manual';
+      document.getElementById('scan-rc-count').hidden = mode !== 'count';
+      if (mode === 'count') {
+        countState = { count: 0 };
+        renderCountDisplay(sku);
+        moveCameraInto(document.getElementById('scan-rc-count-camera-slot'));
+        startCountScanner(sku);
+      } else {
+        teardownCountMode();
+      }
+    });
+  });
+
+  document.getElementById('btn-rc-count-undo')?.addEventListener('click', () => {
+    if (!countState || countState.count === 0) return;
+    countState.count -= 1;
+    renderCountDisplay(sku);
+  });
+
+  document.getElementById('btn-rc-count-cancel')?.addEventListener('click', () => {
+    teardownCountMode();
+    document.querySelectorAll('#rc-mode-tabs button').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.mode === 'manual')));
+    document.getElementById('scan-rc-manual').hidden = false;
+    document.getElementById('scan-rc-count').hidden = true;
+  });
+
+  document.getElementById('btn-confirm-scan-count')?.addEventListener('click', async () => {
+    const errEl = document.getElementById('scan-rc-count-error');
+    errEl.innerHTML = '';
+    if (!countState || !countState.count) {
+      errEl.innerHTML = `<div class="form-error">${escapeHtml(t('errorCountZero'))}</div>`;
+      return;
+    }
+    const qty = countState.count;
+    const receivedBy = document.getElementById('scan-rc-count-by').value.trim();
+    const btn = document.getElementById('btn-confirm-scan-count');
+    const label = document.getElementById('scan-rc-count-confirm-label');
+    btn.disabled = true; label.textContent = t('btnConfirming');
+    stopCountScanner();
+    try {
+      const updated = await DB.receiveStock({ skuId: sku.sku_id, qty, uom: sku.base_uom, receivedBy, supplierRef: null, imagePaths: [] });
+      toast(t('toastStockReceived', fmtQty(qty), escapeHtml(sku.base_uom), escapeHtml(updated.sku_code)), 'success');
+      countState = null;
+      resetScanView();
+    } catch (err) {
+      errEl.innerHTML = `<div class="form-error">${escapeHtml(err.message || 'Could not receive stock')}</div>`;
+      btn.disabled = false; label.textContent = t('btnConfirmReceive');
+      if (countState) startCountScanner(sku); // resume counting since nothing was committed
+    }
   });
 
   const reqSel = document.getElementById('issue-request');
