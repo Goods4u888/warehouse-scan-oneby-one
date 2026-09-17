@@ -437,8 +437,8 @@ td.num, th.num { text-align: right; font-family: var(--mono); }
    on print so it never shows up on the printed requisition slip. */
 .app-version {
   position: fixed; right: 8px; bottom: 3px; z-index: 40;
-  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
-  opacity: .55; pointer-events: none; user-select: none;
+  font-family: var(--mono); font-size: 16px; color: #000;
+  opacity: 1; pointer-events: none; user-select: none;
 }
 
 /* ---- Loading skeleton ---------------------------------------------------------------- */
@@ -676,7 +676,7 @@ body.hub-page { background: var(--lp-bg); color: var(--lp-ink); overflow-x: hidd
 body.hub-page .header { background: var(--lp-bg); border-bottom-color: var(--lp-line); }
 body.hub-page .header-title { color: var(--lp-ink); font-family: var(--lp-display); }
 body.hub-page .eyebrow { color: var(--lp-brand-dark); }
-body.hub-page .app-version { color: var(--lp-ink-2); }
+body.hub-page .app-version { color: #000; }
 body.hub-page .btn-ghost { color: var(--lp-ink-2); }
 body.hub-page .btn-ghost:hover { color: var(--lp-ink); background: var(--lp-line); }
 
@@ -763,7 +763,7 @@ body.hub-page .chip-neutral { background: var(--lp-amber-wash); color: var(--lp-
 
 .login-screen .header-title { font-family: var(--lp-display); }
 .login-screen .eyebrow { color: var(--lp-amber-dark); }
-.login-screen .app-version { color: var(--lp-ink-2); }
+.login-screen .app-version { color: #000; }
 
 .login-screen .login-card {
   background: var(--lp-surface); border: 1px solid var(--lp-line);
