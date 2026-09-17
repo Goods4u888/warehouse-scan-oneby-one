@@ -214,11 +214,9 @@ create table if not exists work_areas (
   created_at  timestamptz not null default now()
 );
 
--- Backfill: work_area values typed freely before this table existed
--- shouldn't vanish from the dropdown's suggestions once it switches over.
-insert into work_areas (name)
-select distinct work_area from requests where work_area is not null and work_area <> ''
-on conflict (name) do nothing;
+-- Backfill for work_areas: moved to the end of section 3 below (it reads
+-- from requests.work_area, which doesn't exist yet at this point in the
+-- file on a fresh install — see the note there).
 
 -- ----------------------------------------------------------------------------
 -- 2. Lots — LEGACY as of 2026-09-08. Originally one row per receiving
@@ -375,6 +373,15 @@ begin
       add constraint requests_item_or_note_chk check (sku_id is not null or notes is not null);
   end if;
 end $$;
+
+-- Backfill: work_area values typed freely before the work_areas dropdown
+-- table existed (section 1f above) shouldn't vanish from its suggestions
+-- once it switches over. Placed here, not right after work_areas is
+-- created, because it reads requests.work_area — both the table and that
+-- column only exist as of this point in the file.
+insert into work_areas (name)
+select distinct work_area from requests where work_area is not null and work_area <> ''
+on conflict (name) do nothing;
 
 -- ----------------------------------------------------------------------------
 -- 4. Transactions — every receive / issue / return event (the movement
