@@ -296,6 +296,62 @@ const DB = {
     return data;
   },
 
+  // A numbered unit sticker (e.g. "CEM-014#0007", minted by
+  // create_item_units() in schema.sql) — what the fulfill/return sheets'
+  // "Scan units" mode looks up on each scan, as an alternative to typing a
+  // quantity. Distinct from findSkuByCode above: this resolves one specific
+  // physical unit, not the item type.
+  async findUnitByCode(unitCode) {
+    const { data, error } = await supabaseClient
+      .from('item_units')
+      .select('*')
+      .eq('unit_code', unitCode.trim())
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  },
+
+  // The units create_item_units() just minted for a receive — fetched right
+  // after receiveStock() succeeds so the client can print one sticker per
+  // unit (see printUnitStickers() in app.js). Newest first by unit_no, same
+  // ordering the numbers were assigned in.
+  async listRecentUnits(skuId, limit) {
+    const { data, error } = await supabaseClient
+      .from('item_units')
+      .select('*')
+      .eq('sku_id', skuId)
+      .order('unit_no', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    return (data || []).slice().reverse();
+  },
+
+  // How many of a SKU's units are still unaccounted for — Manage Items'
+  // "Generate missing unit stickers" backfill uses this to work out how
+  // many new item_units rows a SKU received before this feature (or
+  // received in a fractional amount) still needs.
+  async countInStockUnits(skuId) {
+    const { count, error } = await supabaseClient
+      .from('item_units')
+      .select('id', { count: 'exact', head: true })
+      .eq('sku_id', skuId)
+      .eq('status', 'in_stock');
+    if (error) throw error;
+    return count || 0;
+  },
+
+  // Mints p_qty new unit stickers directly (create_item_units() in
+  // schema.sql), not tied to any specific receive transaction — used only
+  // by the Manage Items backfill action above.
+  async createItemUnits(skuId, qty) {
+    const { error } = await supabaseClient.rpc('create_item_units', {
+      p_sku_id: skuId,
+      p_qty: qty,
+      p_transaction_id: null,
+    });
+    if (error) throw error;
+  },
+
   // ---- Receiving ------------------------------------------------------------
   async receiveStock({ skuId, qty, uom, receivedBy, supplierRef, imagePaths }) {
     const { data, error } = await supabaseClient.rpc('receive_stock', {
@@ -315,7 +371,7 @@ const DB = {
   // straight onto the item's qty_on_hand, same as receiving — see
   // return_stock() in schema.sql. Freeform: not tied to a specific original
   // request.
-  async returnStock({ skuId, qty, uom, returnedBy, note, imagePaths, requestId }) {
+  async returnStock({ skuId, qty, uom, returnedBy, note, imagePaths, requestId, unitCodes }) {
     const { data, error } = await supabaseClient.rpc('return_stock', {
       p_sku_id: skuId,
       p_qty: qty,
@@ -324,6 +380,7 @@ const DB = {
       p_note: note || null,
       p_image_paths: imagePaths && imagePaths.length ? imagePaths : null,
       p_request_id: requestId || null,
+      p_unit_codes: unitCodes && unitCodes.length ? unitCodes : null,
     });
     if (error) throw error;
     return data;
@@ -469,13 +526,15 @@ const DB = {
   },
 
   // ---- Issuing (scan-to-deduct) -----------------------------------------------
-  async issueStock({ skuId, requestId, actualQty, performedBy, imagePaths }) {
+  async issueStock({ skuId, requestId, actualQty, performedBy, imagePaths, shortfallNote, unitCodes }) {
     const { data, error } = await supabaseClient.rpc('issue_stock', {
       p_sku_id: skuId,
       p_request_id: requestId,
       p_actual_qty: actualQty,
       p_performed_by: performedBy || null,
       p_image_paths: imagePaths && imagePaths.length ? imagePaths : null,
+      p_shortfall_note: shortfallNote || null,
+      p_unit_codes: unitCodes && unitCodes.length ? unitCodes : null,
     });
     if (error) throw error;
     return data;

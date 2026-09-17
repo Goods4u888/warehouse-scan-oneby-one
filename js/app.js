@@ -634,6 +634,12 @@ function renderManageItemsLists() {
       if (sku) printSkuSticker(sku, readStickerCount(`mi-print-qty-${sku.id}`));
     });
   });
+  document.querySelectorAll('[data-mi-units]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const sku = miAllSkus.find((s) => s.id === btn.dataset.miUnits);
+      if (sku) generateMissingUnitStickers(sku);
+    });
+  });
   document.querySelectorAll('[data-mi-select]').forEach((cb) => {
     cb.addEventListener('change', () => {
       if (cb.checked) miSelectedIds.add(cb.dataset.miSelect);
@@ -682,6 +688,7 @@ function miRowHtml(s) {
           <input type="number" class="qty-mini-input" id="mi-print-qty-${s.id}" min="1" max="${STICKERS_PER_SHEET_MAX}" value="${STICKERS_PER_SHEET}">
         </div>
         <button class="btn btn-outline btn-sm" data-mi-print="${s.id}">${icon('printer', 14)}<span>${t('btnPrintSticker')}</span></button>
+        <button class="btn btn-outline btn-sm" data-mi-units="${s.id}">${icon('qr', 14)}<span>${t('btnGenerateMissingUnits')}</span></button>
         ${s.is_active
           ? `<button class="btn btn-ghost btn-sm" data-mi-toggle="${s.id}" data-to-active="false">${icon('xCircle', 14)}<span>${t('btnDeactivate')}</span></button>`
           : `<button class="btn btn-ghost btn-sm" data-mi-toggle="${s.id}" data-to-active="true">${icon('checkCircle', 14)}<span>${t('btnActivate')}</span></button>`}
@@ -711,6 +718,22 @@ function printStickerSheet(sku, idPrefix, count = STICKERS_PER_SHEET) {
   window.print();
 }
 
+// One sticker per PHYSICAL unit, each with its own unit_code (e.g.
+// "CEM-014#0007") rather than the item's shared sku_code — used right
+// after receiving mints new item_units rows (see create_item_units() in
+// schema.sql), so every unit gets its own numbered QR to scan one-by-one at
+// fulfillment/return. Same print surface/CSS as printStickerSheet above,
+// just one distinct code per sticker instead of N copies of the same one.
+function printUnitStickers(units, skuName) {
+  if (!units.length) return;
+  const box = document.getElementById('admin-print-sheet');
+  box.innerHTML = units
+    .map((u, i) => QR.stickerHtml({ skuCode: u.unit_code, skuName, idPrefix: `unit-sticker-qr-${i}-` }))
+    .join('');
+  units.forEach((u, i) => QR.renderInto(document.getElementById(`unit-sticker-qr-${i}-${u.unit_code}`), u.unit_code, 120));
+  window.print();
+}
+
 // Reads the copies-to-print field next to a print button (see
 // .qty-mini-input in app.css) — falls back to STICKERS_PER_SHEET for
 // anything blank/non-numeric/zero, and caps at STICKERS_PER_SHEET_MAX so a
@@ -725,6 +748,28 @@ function readStickerCount(inputId) {
 // to a receive/return event.
 function printSkuSticker(sku, count) {
   printStickerSheet(sku, 'mi-sticker-qr-', count);
+}
+
+// One-time backfill for stock that predates unit tracking (or was received
+// in a fractional amount before this SKU's units caught up): mints exactly
+// enough new item_units to close the gap between qty_on_hand and how many
+// units are actually in_stock right now, then prints them. Safe to run
+// repeatedly — once the counts match, there's nothing left to generate.
+async function generateMissingUnitStickers(sku) {
+  try {
+    const inStock = await DB.countInStockUnits(sku.id);
+    const gap = Math.floor(sku.qty_on_hand) - inStock;
+    if (gap <= 0) {
+      toast(t('toastNoMissingUnits'), 'success');
+      return;
+    }
+    await DB.createItemUnits(sku.id, gap);
+    const units = await DB.listRecentUnits(sku.id, gap);
+    printUnitStickers(units, sku.name);
+    toast(t('toastUnitsGenerated', gap), 'success');
+  } catch (err) {
+    toast(err.message || 'Could not generate unit stickers', 'error');
+  }
 }
 
 // Bulk version: every checked Manage Items row, laid out as a grid of
@@ -919,7 +964,7 @@ document.getElementById('form-receive').addEventListener('submit', async (e) => 
   try {
     const imagePaths = await uploadEvidenceFor('rc', 'receive');
     const sku = await DB.receiveStock({ skuId, qty, uom, receivedBy, supplierRef, imagePaths });
-    renderReceiveResult(sku, qty, uom);
+    await renderReceiveResult(sku, qty, uom);
     e.target.reset();
     resetEvidence('rc');
     refreshReceiveSkuOptions();
@@ -935,23 +980,39 @@ document.getElementById('form-receive').addEventListener('submit', async (e) => 
 // already includes this delivery) — qty/uom are this specific delivery's
 // amount, shown as a confirmation line above the item's one permanent
 // sticker (which itself carries no quantity — see qr.js).
-function renderReceiveResult(sku, qty, uom) {
+async function renderReceiveResult(sku, qty, uom) {
   const box = document.getElementById('receive-result');
+  // create_item_units() (called inside receive_stock() in schema.sql)
+  // already minted one numbered unit per whole item in this delivery —
+  // fetch them back for printing instead of the old single
+  // shared-sku_code sticker, which only still applies when the delivery
+  // was purely fractional (no whole units to number).
+  const unitCount = Math.floor(qty);
+  const units = unitCount >= 1 ? await DB.listRecentUnits(sku.id, unitCount) : [];
   box.innerHTML = `
     <div class="card">
       <div class="eyebrow">${t('stickerReady')}</div>
       <p class="field-hint">${t('receiveConfirmLine', fmtQty(qty), escapeHtml(uom), fmtQty(sku.qty_on_hand))}</p>
-      ${QR.stickerHtml({ skuCode: sku.sku_code, skuName: sku.name })}
-      <div class="field-with-btn" style="margin-top:var(--s4)">
-        <div class="qty-field">
-          <label class="qty-field-label" for="rc-print-qty">${t('fieldCopies')}</label>
-          <input type="number" class="qty-mini-input" id="rc-print-qty" min="1" max="${STICKERS_PER_SHEET_MAX}" value="${STICKERS_PER_SHEET}">
+      ${units.length ? `
+        <p class="field-hint">${t('labelUnitsMinted', units.length)}</p>
+        <button class="btn btn-outline btn-block" id="btn-print-unit-stickers" style="margin-top:var(--s3)">${icon('printer', 16)}<span>${t('btnPrintUnitStickers', units.length)}</span></button>
+      ` : `
+        ${QR.stickerHtml({ skuCode: sku.sku_code, skuName: sku.name })}
+        <div class="field-with-btn" style="margin-top:var(--s4)">
+          <div class="qty-field">
+            <label class="qty-field-label" for="rc-print-qty">${t('fieldCopies')}</label>
+            <input type="number" class="qty-mini-input" id="rc-print-qty" min="1" max="${STICKERS_PER_SHEET_MAX}" value="${STICKERS_PER_SHEET}">
+          </div>
+          <button class="btn btn-outline" id="btn-print-sticker">${icon('printer', 16)}<span>${t('btnPrintSticker')}</span></button>
         </div>
-        <button class="btn btn-outline" id="btn-print-sticker">${icon('printer', 16)}<span>${t('btnPrintSticker')}</span></button>
-      </div>
+      `}
     </div>`;
-  QR.renderInto(document.getElementById(`sticker-qr-${sku.sku_code}`), sku.sku_code, 120);
-  document.getElementById('btn-print-sticker').addEventListener('click', () => printStickerSheet(sku, 'rc-sticker-qr-', readStickerCount('rc-print-qty')));
+  if (units.length) {
+    document.getElementById('btn-print-unit-stickers').addEventListener('click', () => printUnitStickers(units, sku.name));
+  } else {
+    QR.renderInto(document.getElementById(`sticker-qr-${sku.sku_code}`), sku.sku_code, 120);
+    document.getElementById('btn-print-sticker').addEventListener('click', () => printStickerSheet(sku, 'rc-sticker-qr-', readStickerCount('rc-print-qty')));
+  }
 }
 
 // ---- Receive / Return mode toggle -------------------------------------------
@@ -1090,6 +1151,8 @@ document.getElementById('btn-rt-lookup-request').addEventListener('click', async
       baseUom: tx.skus?.base_uom || tx.uom,
       issuedQty: tx.qty,
       returnQty: tx.qty,
+      mode: 'manual', // 'manual' (typed qty) or 'scan' (scan back the numbered units issued for this request)
+      scannedUnits: [],
     }));
     openReturnByRequestSheet();
   } catch (err) {
@@ -1100,16 +1163,49 @@ document.getElementById('rt-request-code').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btn-rt-lookup-request').click(); }
 });
 
+// Validates a scanned unit for a return-by-request row: must belong to
+// this row's SKU, still be issued, and — the guard the user specifically
+// asked for — issued under *this* request, not some other one.
+function validateReturnUnitScan(row, unit, code) {
+  if (!unit) return { ok: false, reason: t('toastUnitNotFound', code) };
+  if (unit.sku_id !== row.skuId) return { ok: false, reason: t('toastWrongItemScanned', unit.unit_code) };
+  if (unit.status !== 'issued' || unit.issued_request_id !== row.requestId) return { ok: false, reason: t('toastUnitNotIssuedHere', unit.unit_code) };
+  if (row.scannedUnits.includes(unit.unit_code)) return { ok: false, reason: t('toastUnitAlreadyScanned', unit.unit_code) };
+  if (row.scannedUnits.length >= row.issuedQty) return { ok: false, reason: t('toastRequestLineComplete') };
+  return { ok: true };
+}
+
+function updateReturnScanRowUI(row) {
+  const countEl = document.getElementById(`rtreq-scan-count-${row.txnId}`);
+  if (countEl) countEl.textContent = t('labelScanCount', row.scannedUnits.length, row.baseUom);
+  const undoBtn = document.getElementById(`rtreq-scan-undo-${row.txnId}`);
+  if (undoBtn) undoBtn.disabled = row.scannedUnits.length === 0;
+  row.returnQty = row.scannedUnits.length;
+}
+
 function returnByRequestRowHtml(row) {
+  const scanned = row.scannedUnits.length;
   return `
     <div class="card" style="margin-bottom:var(--s3)">
       <div class="card-title">${escapeHtml(row.name)}</div>
       <div class="card-meta mono">${escapeHtml(row.skuCode)}</div>
-      <div class="field" style="margin-top:var(--s2)">
-        <label for="rtreq-qty-${row.txnId}">${t('fieldQtyReturned')}</label>
-        <input type="number" class="rtreq-qty-input" id="rtreq-qty-${row.txnId}" data-id="${row.txnId}" min="0" step="any" max="${row.issuedQty}" value="${row.returnQty}">
-        <p class="field-hint">${t('hintIssuedQty', fmtQty(row.issuedQty), escapeHtml(row.baseUom))}</p>
+      <div class="segmented rtreq-mode-tabs" data-id="${row.txnId}" role="tablist" style="margin-top:var(--s3)">
+        <button type="button" data-mode="manual" aria-pressed="${row.mode === 'manual'}">${t('scanModeManual')}</button>
+        <button type="button" data-mode="scan" aria-pressed="${row.mode === 'scan'}">${t('scanModeUnits')}</button>
       </div>
+      ${row.mode === 'manual' ? `
+        <div class="field" style="margin-top:var(--s3)">
+          <label for="rtreq-qty-${row.txnId}">${t('fieldQtyReturned')}</label>
+          <input type="number" class="rtreq-qty-input" id="rtreq-qty-${row.txnId}" data-id="${row.txnId}" min="0" step="any" max="${row.issuedQty}" value="${row.returnQty}">
+          <p class="field-hint">${t('hintIssuedQty', fmtQty(row.issuedQty), escapeHtml(row.baseUom))}</p>
+        </div>
+      ` : `
+        <div class="rtreq-scan-slot" data-id="${row.txnId}" style="margin-top:var(--s3)"></div>
+        <p class="scan-note">${t('hintScanUnitsReturn')}</p>
+        <div class="stat-figure" id="rtreq-scan-count-${row.txnId}" style="font-size:var(--t-card)">${t('labelScanCount', scanned, row.baseUom)}</div>
+        <p class="field-hint">${t('hintIssuedQty', fmtQty(row.issuedQty), escapeHtml(row.baseUom))}</p>
+        <button type="button" class="btn btn-outline rtreq-scan-undo" id="rtreq-scan-undo-${row.txnId}" data-id="${row.txnId}" style="margin-top:var(--s2)" ${scanned === 0 ? 'disabled' : ''}>${t('btnUndoLastScan')}</button>
+      `}
     </div>
   `;
 }
@@ -1138,17 +1234,60 @@ function openReturnByRequestSheet() {
       <input type="file" id="rtreq-photos" accept="image/*" multiple>
       <div class="evidence-thumbs" id="rtreq-photos-preview"></div>
     </div>
+    <div class="field">
+      <label for="rtreq-form-photo">${t('fieldFormPhoto')}</label>
+      <input type="file" id="rtreq-form-photo" accept="image/*" capture="environment">
+    </div>
+    <div class="field">
+      <label>${t('fieldSignature')}</label>
+      <canvas id="rtreq-signature" class="signature-pad"></canvas>
+      <button type="button" class="btn btn-ghost btn-sm" id="rtreq-signature-clear">${t('btnClearSignature')}</button>
+    </div>
     <button type="button" class="btn btn-primary btn-block" id="btn-rtreq-save" style="margin-top:var(--s4)">${icon('check', 16)}<span id="rtreq-save-label">${t('btnSave')}</span></button>
   `);
   applyStaticIcons();
-  wireEvidencePicker('rtreq');
+  wirePhotoPickerKeepState('rtreq');
   document.querySelectorAll('.rtreq-qty-input').forEach((input) => {
     input.addEventListener('input', () => {
       const row = returnByRequestRows.find((r) => r.txnId === input.dataset.id);
       row.returnQty = input.value === '' ? '' : Number(input.value);
     });
   });
+  document.querySelectorAll('.rtreq-mode-tabs button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const row = returnByRequestRows.find((r) => r.txnId === btn.dataset.id);
+      const mode = btn.dataset.mode;
+      if (row.mode === mode) return;
+      UnitScan.stop();
+      row.mode = mode;
+      if (mode === 'manual') row.returnQty = row.issuedQty;
+      openReturnByRequestSheet();
+    });
+  });
+  document.querySelectorAll('.rtreq-scan-undo').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const row = returnByRequestRows.find((r) => r.txnId === btn.dataset.id);
+      UnitScan.undo(row);
+    });
+  });
+  document.getElementById('rtreq-form-photo').addEventListener('change', (e) => {
+    if (!evidenceState.rtreq) evidenceState.rtreq = [];
+    if (e.target.files[0]) evidenceState.rtreq.push(e.target.files[0]);
+  });
+  Signature.mount(document.getElementById('rtreq-signature'));
+  document.getElementById('rtreq-signature-clear').addEventListener('click', () => {
+    Signature.clear(document.getElementById('rtreq-signature'));
+  });
   document.getElementById('btn-rtreq-save').addEventListener('click', onReturnByRequestSave);
+
+  returnByRequestRows.forEach((row) => {
+    row.onScanChange = () => updateReturnScanRowUI(row);
+    row.validateUnitScan = (unit, code) => validateReturnUnitScan(row, unit, code);
+    if (row.mode === 'scan') {
+      const slot = document.querySelector(`.rtreq-scan-slot[data-id="${row.txnId}"]`);
+      if (slot) UnitScan.start(row, slot);
+    }
+  });
 }
 
 async function onReturnByRequestSave() {
@@ -1186,9 +1325,16 @@ async function onReturnByRequestSave() {
   const label = document.getElementById('rtreq-save-label');
   btn.disabled = true; label.textContent = t('btnGenerating');
   try {
+    UnitScan.stop();
+    const signatureCanvas = document.getElementById('rtreq-signature');
+    if (signatureCanvas && !Signature.isEmpty(signatureCanvas)) {
+      if (!evidenceState.rtreq) evidenceState.rtreq = [];
+      evidenceState.rtreq.push(await Signature.toBlob(signatureCanvas));
+    }
     const imagePaths = await uploadEvidenceFor('rtreq', 'return');
     for (const row of returningRows) {
-      await DB.returnStock({ skuId: row.skuId, qty: Number(row.returnQty), uom: row.baseUom, returnedBy, note: note || null, imagePaths, requestId: row.requestId });
+      const unitCodes = row.mode === 'scan' ? row.scannedUnits : null;
+      await DB.returnStock({ skuId: row.skuId, qty: Number(row.returnQty), uom: row.baseUom, returnedBy, note: note || null, imagePaths, requestId: row.requestId, unitCodes });
     }
     toast(t('toastReturnByRequestDone', returningRows.length), 'success');
     resetEvidence('rtreq');
@@ -1294,6 +1440,66 @@ function teardownCountMode() {
     countState = null;
   }
 }
+
+// ----------------------------------------------------------------------------
+// UNIT SCAN — generic "scan numbered unit stickers one by one" engine
+// shared by the Fulfill and Return-by-request sheets (js/db.js
+// findUnitByCode()). Reuses the same camera-reparenting helpers as the
+// Receive scan-to-count mode above (moveCameraInto/restoreCameraHome/
+// stopCountScanner are already generic — nothing there is receive-specific)
+// rather than duplicating them. Exactly one row can be actively scanning at
+// a time, since there's only one physical camera; starting a row stops
+// whichever row had it. Purely local until the caller uses the accumulated
+// unit codes (issue_stock/return_stock at Confirm) — nothing is written to
+// item_units mid-scan, so an abandoned session leaves no trace.
+// ----------------------------------------------------------------------------
+const UnitScan = {
+  activeRow: null, // the row object currently owning the camera, or null
+
+  isActive(row) { return this.activeRow === row; },
+
+  start(row, slotEl) {
+    this.stop();
+    this.activeRow = row;
+    moveCameraInto(slotEl);
+    this._loop();
+  },
+
+  stop() {
+    if (!this.activeRow) return;
+    stopCountScanner();
+    restoreCameraHome();
+    this.activeRow = null;
+  },
+
+  undo(row) {
+    if (!row.scannedUnits.length) return;
+    row.scannedUnits.pop();
+    row.onScanChange && row.onScanChange();
+  },
+
+  async _loop() {
+    const row = this.activeRow;
+    if (!row) return;
+    const video = document.getElementById('scan-video');
+    const canvas = document.getElementById('scan-canvas');
+    QR.startScanner(video, canvas, async (code) => {
+      if (this.activeRow !== row) return; // stopped/switched before this fired
+      let unit = null;
+      try { unit = await DB.findUnitByCode(code); } catch (_) { unit = null; }
+      if (this.activeRow !== row) return; // stopped/switched while the lookup was in flight
+      const result = row.validateUnitScan(unit, code);
+      if (result.ok) {
+        row.scannedUnits.push(unit.unit_code);
+        try { navigator.vibrate && navigator.vibrate(60); } catch (_) {}
+      } else {
+        toast(result.reason, 'error');
+      }
+      row.onScanChange && row.onScanChange();
+      if (this.activeRow === row) this._loop();
+    }, () => { /* no camera — row stays in scan mode but nothing more happens */ }, () => { /* not recognized; loop continues on its own */ });
+  },
+};
 
 document.getElementById('btn-lookup-lot').addEventListener('click', () => {
   const code = document.getElementById('scan-manual').value.trim();
@@ -1493,6 +1699,8 @@ function renderScannedItem(sku, openRequests, preferredAction = null) {
     try {
       const updated = await DB.receiveStock({ skuId: sku.sku_id, qty, uom: sku.base_uom, receivedBy, supplierRef: null, imagePaths: [] });
       toast(t('toastStockReceived', fmtQty(qty), escapeHtml(sku.base_uom), escapeHtml(updated.sku_code)), 'success');
+      const units = await DB.listRecentUnits(sku.sku_id, Math.floor(qty));
+      if (units.length) printUnitStickers(units, sku.name);
       countState = null;
       resetScanView();
     } catch (err) {
@@ -1621,11 +1829,27 @@ async function openFulfillRequestSheet(requestCode) {
     actualQty: r.qty_requested,
     declined: false,
     declineNote: '',
+    mode: 'manual', // 'manual' (typed qty) or 'scan' (scan numbered units one by one)
+    scannedUnits: [],
+    shortfallNote: '',
   }));
   renderFulfillAdjustStep();
 }
 
+// Validates one scanned unit against a fulfill row — must belong to this
+// row's SKU, still be in_stock, not already scanned this session, and the
+// line not already fully covered (scanning stops mattering past that).
+function validateFulfillUnitScan(row, unit, code) {
+  if (!unit) return { ok: false, reason: t('toastUnitNotFound', code) };
+  if (unit.sku_id !== row.skuId) return { ok: false, reason: t('toastWrongItemScanned', unit.unit_code) };
+  if (unit.status !== 'in_stock') return { ok: false, reason: t('toastUnitNotAvailable', unit.unit_code) };
+  if (row.scannedUnits.includes(unit.unit_code)) return { ok: false, reason: t('toastUnitAlreadyScanned', unit.unit_code) };
+  if (row.scannedUnits.length >= row.requestedQty) return { ok: false, reason: t('toastRequestLineComplete') };
+  return { ok: true };
+}
+
 function fulfillRowHtml(row) {
+  const scanned = row.scannedUnits.length;
   return `
     <div class="card" data-row-id="${row.id}" style="margin-bottom:var(--s3)">
       <div class="card-row">
@@ -1635,11 +1859,30 @@ function fulfillRowHtml(row) {
         </div>
         <button type="button" class="btn btn-ghost btn-sm fulfill-decline-toggle" data-id="${row.id}">${icon(row.declined ? 'plusCircle' : 'xCircle', 14)}<span>${row.declined ? t('btnUndoDecline') : t('btnCannotDeliver')}</span></button>
       </div>
-      <div class="field" style="margin-top:var(--s2)">
-        <label for="fulfill-qty-${row.id}">${t('fieldActualQty')}</label>
-        <input type="number" class="fulfill-qty-input" id="fulfill-qty-${row.id}" data-id="${row.id}" min="0.0001" step="any" max="${row.onHand}" value="${row.actualQty}" ${row.declined ? 'disabled' : ''}>
-        <p class="field-hint">${t('hintRequested', fmtQty(row.requestedQty), escapeHtml(row.baseUom))} · ${t('hintOnHand', fmtQty(row.onHand), escapeHtml(row.baseUom))}</p>
-      </div>
+      ${!row.declined ? `
+        <div class="segmented fulfill-mode-tabs" data-id="${row.id}" role="tablist" style="margin-top:var(--s3)">
+          <button type="button" data-mode="manual" aria-pressed="${row.mode === 'manual'}">${t('scanModeManual')}</button>
+          <button type="button" data-mode="scan" aria-pressed="${row.mode === 'scan'}">${t('scanModeUnits')}</button>
+        </div>
+      ` : ''}
+      ${!row.declined && row.mode === 'manual' ? `
+        <div class="field" style="margin-top:var(--s3)">
+          <label for="fulfill-qty-${row.id}">${t('fieldActualQty')}</label>
+          <input type="number" class="fulfill-qty-input" id="fulfill-qty-${row.id}" data-id="${row.id}" min="0.0001" step="any" max="${row.onHand}" value="${row.actualQty}">
+          <p class="field-hint">${t('hintRequested', fmtQty(row.requestedQty), escapeHtml(row.baseUom))} · ${t('hintOnHand', fmtQty(row.onHand), escapeHtml(row.baseUom))}</p>
+        </div>
+      ` : ''}
+      ${!row.declined && row.mode === 'scan' ? `
+        <div class="fulfill-scan-slot" data-id="${row.id}" style="margin-top:var(--s3)"></div>
+        <p class="scan-note">${t('hintScanUnitsFulfill')}</p>
+        <div class="stat-figure" id="fulfill-scan-count-${row.id}" style="font-size:var(--t-card)">${t('labelScanCount', scanned, row.baseUom)}</div>
+        <p class="field-hint">${t('hintRequested', fmtQty(row.requestedQty), escapeHtml(row.baseUom))}</p>
+        <button type="button" class="btn btn-outline fulfill-scan-undo" id="fulfill-scan-undo-${row.id}" data-id="${row.id}" style="margin-top:var(--s2)" ${scanned === 0 ? 'disabled' : ''}>${t('btnUndoLastScan')}</button>
+        <div class="field" id="fulfill-shortfall-wrap-${row.id}" style="margin-top:var(--s3)" ${scanned > 0 && scanned < row.requestedQty ? '' : 'hidden'}>
+          <label for="fulfill-shortfall-${row.id}">${t('fieldDeclineReason')}</label>
+          <textarea id="fulfill-shortfall-${row.id}" class="fulfill-shortfall-note" data-id="${row.id}" placeholder="${escapeHtml(t('declineReasonPlaceholder'))}">${escapeHtml(row.shortfallNote)}</textarea>
+        </div>
+      ` : ''}
       ${row.declined ? `
         <div class="field">
           <label for="fulfill-note-${row.id}">${t('fieldDeclineReason')}</label>
@@ -1650,15 +1893,31 @@ function fulfillRowHtml(row) {
   `;
 }
 
+// Targeted refresh for a scan-mode row after each scan/undo — deliberately
+// NOT a full renderFulfillAdjustStep(), which would tear down and recreate
+// the DOM node the camera was just moved into mid-scan-loop.
+function updateFulfillScanRowUI(row) {
+  const countEl = document.getElementById(`fulfill-scan-count-${row.id}`);
+  if (countEl) countEl.textContent = t('labelScanCount', row.scannedUnits.length, row.baseUom);
+  const undoBtn = document.getElementById(`fulfill-scan-undo-${row.id}`);
+  if (undoBtn) undoBtn.disabled = row.scannedUnits.length === 0;
+  const wrap = document.getElementById(`fulfill-shortfall-wrap-${row.id}`);
+  if (wrap) wrap.hidden = !(row.scannedUnits.length > 0 && row.scannedUnits.length < row.requestedQty);
+  row.actualQty = row.scannedUnits.length;
+}
+
 function wireFulfillRowEvents() {
   document.querySelectorAll('.fulfill-decline-toggle').forEach((btn) => {
     btn.addEventListener('click', () => {
       // Capture whatever's currently typed before re-rendering the whole
       // step wipes the DOM out from under it.
       fulfillPickedUpBy = document.getElementById('fulfill-picked-up-by').value;
+      UnitScan.stop();
       const row = fulfillRows.find((r) => r.id === btn.dataset.id);
       row.declined = !row.declined;
       row.actualQty = row.declined ? 0 : row.requestedQty;
+      row.mode = 'manual';
+      row.scannedUnits = [];
       if (!row.declined) row.declineNote = '';
       renderFulfillAdjustStep();
     });
@@ -1675,22 +1934,52 @@ function wireFulfillRowEvents() {
       row.declineNote = ta.value;
     });
   });
+  document.querySelectorAll('.fulfill-shortfall-note').forEach((ta) => {
+    ta.addEventListener('input', () => {
+      const row = fulfillRows.find((r) => r.id === ta.dataset.id);
+      row.shortfallNote = ta.value;
+    });
+  });
+  document.querySelectorAll('.fulfill-mode-tabs button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      fulfillPickedUpBy = document.getElementById('fulfill-picked-up-by').value;
+      const row = fulfillRows.find((r) => r.id === btn.dataset.id);
+      const mode = btn.dataset.mode;
+      if (row.mode === mode) return;
+      UnitScan.stop();
+      row.mode = mode;
+      if (mode === 'manual') {
+        row.actualQty = row.requestedQty;
+      }
+      renderFulfillAdjustStep();
+    });
+  });
+  document.querySelectorAll('.fulfill-scan-undo').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const row = fulfillRows.find((r) => r.id === btn.dataset.id);
+      UnitScan.undo(row);
+    });
+  });
 }
 
-// Re-attaches the photo picker without resetting evidenceState.fulfill —
-// wireEvidencePicker() (shared with Receive/Return/single-item Issue)
-// always resets its state on call, which would silently drop already-
-// selected photos every time "cannot deliver" toggles a row and re-
-// renders this whole step.
-function wireFulfillPhotoPicker() {
-  if (!evidenceState.fulfill) evidenceState.fulfill = [];
-  const input = document.getElementById('fulfill-photos');
+// Re-attaches a photo picker without resetting evidenceState[prefix] —
+// wireEvidencePicker() (shared with Receive/single-item Issue) always
+// resets its state on call, which would silently drop already-selected
+// photos every time a re-render happens mid-flow (a fulfill row's "cannot
+// deliver" toggle, or a return row's Manual/Scan units toggle).
+function wirePhotoPickerKeepState(prefix) {
+  if (!evidenceState[prefix]) evidenceState[prefix] = [];
+  const input = document.getElementById(`${prefix}-photos`);
   input.addEventListener('change', (e) => {
-    evidenceState.fulfill = [...evidenceState.fulfill, ...Array.from(e.target.files)];
+    evidenceState[prefix] = [...evidenceState[prefix], ...Array.from(e.target.files)];
     e.target.value = '';
-    renderEvidenceThumbs('fulfill');
+    renderEvidenceThumbs(prefix);
   });
-  renderEvidenceThumbs('fulfill');
+  renderEvidenceThumbs(prefix);
+}
+
+function wireFulfillPhotoPicker() {
+  wirePhotoPickerKeepState('fulfill');
 }
 
 function renderFulfillAdjustStep() {
@@ -1719,6 +2008,15 @@ function renderFulfillAdjustStep() {
   wireFulfillRowEvents();
   wireFulfillPhotoPicker();
   document.getElementById('btn-fulfill-review').addEventListener('click', onFulfillReviewClick);
+
+  fulfillRows.forEach((row) => {
+    row.onScanChange = () => updateFulfillScanRowUI(row);
+    row.validateUnitScan = (unit, code) => validateFulfillUnitScan(row, unit, code);
+    if (row.mode === 'scan') {
+      const slot = document.querySelector(`.fulfill-scan-slot[data-id="${row.id}"]`);
+      if (slot) UnitScan.start(row, slot);
+    }
+  });
 }
 
 function onFulfillReviewClick() {
@@ -1765,10 +2063,20 @@ function onFulfillReviewClick() {
     document.getElementById(`fulfill-note-${missingNote.id}`)?.focus();
     return;
   }
+  // A scan-mode row that stopped short of the requested count needs the
+  // same "what happened" explanation a decline does — just attached to a
+  // partial delivery instead of a zero one.
+  const missingShortfall = deliveringRows.find((r) => r.mode === 'scan' && r.scannedUnits.length > 0 && r.scannedUnits.length < r.requestedQty && !r.shortfallNote.trim());
+  if (missingShortfall) {
+    errEl.innerHTML = `<div class="form-error">${escapeHtml(t('errorDeclineReasonRequired'))}</div>`;
+    document.getElementById(`fulfill-shortfall-${missingShortfall.id}`)?.focus();
+    return;
+  }
   if (deliveringRows.length && !fulfillPickedUpBy) {
     errEl.innerHTML = `<div class="form-error">${escapeHtml(t('fieldPickedUpByRequired'))}</div>`;
     return;
   }
+  UnitScan.stop();
 
   renderFulfillReviewStep();
 }
@@ -1794,12 +2102,29 @@ function renderFulfillReviewStep() {
       </table>
     </div>
     <div class="confirm-row" style="margin-top:var(--s4)"><span>${t('fieldPickedUpBy')}</span><strong>${escapeHtml(fulfillPickedUpBy || '—')}</strong></div>
+    <div class="field" style="margin-top:var(--s4)">
+      <label for="fulfill-form-photo">${t('fieldFormPhoto')}</label>
+      <input type="file" id="fulfill-form-photo" accept="image/*" capture="environment">
+    </div>
+    <div class="field">
+      <label>${t('fieldSignature')}</label>
+      <canvas id="fulfill-signature" class="signature-pad"></canvas>
+      <button type="button" class="btn btn-ghost btn-sm" id="fulfill-signature-clear">${t('btnClearSignature')}</button>
+    </div>
     <button type="button" class="btn btn-outline btn-block" id="btn-fulfill-back" style="margin-top:var(--s4)">${icon('arrowRight', 16)}<span>${t('btnBackToAdjust')}</span></button>
     <button type="button" class="btn btn-primary btn-block" id="btn-fulfill-confirm" style="margin-top:var(--s3)">${icon('check', 16)}<span id="fulfill-confirm-label">${t('btnConfirmFulfill')}</span></button>
   `);
   applyStaticIcons();
   document.getElementById('btn-fulfill-back').addEventListener('click', renderFulfillAdjustStep);
   document.getElementById('btn-fulfill-confirm').addEventListener('click', onFulfillConfirmClick);
+  document.getElementById('fulfill-form-photo').addEventListener('change', (e) => {
+    if (!evidenceState.fulfill) evidenceState.fulfill = [];
+    if (e.target.files[0]) evidenceState.fulfill.push(e.target.files[0]);
+  });
+  Signature.mount(document.getElementById('fulfill-signature'));
+  document.getElementById('fulfill-signature-clear').addEventListener('click', () => {
+    Signature.clear(document.getElementById('fulfill-signature'));
+  });
 }
 
 async function onFulfillConfirmClick() {
@@ -1810,6 +2135,11 @@ async function onFulfillConfirmClick() {
   btn.disabled = true; label.textContent = t('btnConfirming');
 
   try {
+    const signatureCanvas = document.getElementById('fulfill-signature');
+    if (signatureCanvas && !Signature.isEmpty(signatureCanvas)) {
+      if (!evidenceState.fulfill) evidenceState.fulfill = [];
+      evidenceState.fulfill.push(await Signature.toBlob(signatureCanvas));
+    }
     const imagePaths = await uploadEvidenceFor('fulfill', 'issue');
     let delivered = 0;
     let declined = 0;
@@ -1820,7 +2150,9 @@ async function onFulfillConfirmClick() {
           await DB.declineRequestItem(row.id, row.declineNote.trim());
           declined++;
         } else {
-          await DB.issueStock({ skuId: row.skuId, requestId: row.id, actualQty: Number(row.actualQty), performedBy: fulfillPickedUpBy, imagePaths });
+          const unitCodes = row.mode === 'scan' ? row.scannedUnits : null;
+          const shortfallNote = row.mode === 'scan' ? row.shortfallNote.trim() || null : null;
+          await DB.issueStock({ skuId: row.skuId, requestId: row.id, actualQty: Number(row.actualQty), performedBy: fulfillPickedUpBy, imagePaths, unitCodes, shortfallNote });
           delivered++;
         }
       } catch (err) {

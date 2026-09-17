@@ -512,6 +512,73 @@ create table if not exists request_sequences (
 );
 
 -- ----------------------------------------------------------------------------
+-- 5e. Item units — one row per physical unit, each with its own numbered QR
+--     sticker (unit_code, e.g. "CEM-014#0007"), so staff can scan units one
+--     by one during fulfillment/return instead of typing a quantity. Rides
+--     alongside skus.qty_on_hand as metadata, not a second source of truth
+--     for the running total — receive_stock()/issue_stock()/return_stock()
+--     below still own the actual stock math; this table just tracks which
+--     specific physical unit is in_stock / issued / returned, and (for
+--     issued units) which request they were issued against, so a return can
+--     reject a unit that wasn't actually issued under that request.
+-- ----------------------------------------------------------------------------
+create table if not exists item_units (
+  id                       uuid primary key default gen_random_uuid(),
+  sku_id                   uuid not null references skus(id) on delete restrict,
+  unit_no                  integer not null,
+  unit_code                text not null unique,
+  status                   text not null default 'in_stock' check (status in ('in_stock','issued','returned')),
+  received_transaction_id  uuid references transactions(id) on delete set null,
+  issued_request_id        uuid references requests(id) on delete set null,
+  issued_transaction_id    uuid references transactions(id) on delete set null,
+  returned_transaction_id  uuid references transactions(id) on delete set null,
+  created_at               timestamptz not null default now()
+);
+create index if not exists item_units_sku_id_idx on item_units(sku_id);
+create index if not exists item_units_status_idx on item_units(sku_id, status);
+
+-- Per-SKU running counter for unit_no, same atomic-upsert idiom as
+-- lot_sequences/sku_sequences above — see create_item_units() below.
+create table if not exists sku_unit_sequences (
+  sku_id    uuid primary key references skus(id) on delete cascade,
+  last_seq  integer not null default 0
+);
+
+-- Mints p_qty new item_units rows for a SKU, numbered sequentially from
+-- that SKU's own counter. Called from receive_stock() below (p_transaction_id
+-- set, tying the new units to the receive event that created them) and
+-- directly from Manage Items' "Generate missing unit stickers" backfill
+-- action for stock received before this table existed (p_transaction_id
+-- null — there's no single receive event to point at).
+create or replace function create_item_units(p_sku_id uuid, p_qty int, p_transaction_id uuid default null) returns void
+language plpgsql
+as $$
+declare
+  v_sku_code text;
+  v_seq integer;
+  i integer;
+begin
+  if p_qty is null or p_qty < 1 then
+    return;
+  end if;
+
+  select sku_code into v_sku_code from skus where id = p_sku_id;
+  if v_sku_code is null then
+    raise exception 'SKU not found';
+  end if;
+
+  for i in 1..p_qty loop
+    insert into sku_unit_sequences (sku_id, last_seq) values (p_sku_id, 1)
+    on conflict (sku_id) do update set last_seq = sku_unit_sequences.last_seq + 1
+    returning last_seq into v_seq;
+
+    insert into item_units (sku_id, unit_no, unit_code, received_transaction_id)
+    values (p_sku_id, v_seq, v_sku_code || '#' || lpad(v_seq::text, 4, '0'), p_transaction_id);
+  end loop;
+end;
+$$;
+
+-- ----------------------------------------------------------------------------
 -- 6. Views — current stock, read straight off skus.qty_on_hand as of
 --    2026-09-08 (previously summed from lots — see the "2. Lots" note).
 -- ----------------------------------------------------------------------------
@@ -697,6 +764,13 @@ begin
 
   perform insert_transaction_images(v_txn.id, p_image_paths);
 
+  -- Mint one numbered item_units row per whole unit received, so this
+  -- batch is immediately scannable one-by-one at fulfillment/return. A
+  -- fractional qty (e.g. 2.5 cu.m of sand) mints floor(qty) units and
+  -- silently leaves the remainder un-stickered — qty_on_hand above already
+  -- carries the true total either way, this table is metadata on top.
+  perform create_item_units(p_sku_id, floor(p_qty)::int, v_txn.id);
+
   return v_sku;
 end;
 $$;
@@ -712,9 +786,10 @@ $$;
 -- reachable from the public form.
 drop function if exists return_stock(uuid, numeric, text, text, text);
 drop function if exists return_stock(uuid, numeric, text, text, text, text[]);
+drop function if exists return_stock(uuid, numeric, text, text, text, text[], uuid);
 
 -- v2: adds p_image_paths, same reasoning as receive_stock above.
--- v3 (current): adds p_request_id — still optional/nullable (a return
+-- v3: adds p_request_id — still optional/nullable (a return
 -- genuinely doesn't always have one, per the "deliberately freeform"
 -- reasoning above), but when the Return tab's "return against a request
 -- number" screen (js/app.js openReturnByRequestSheet()) already knows
@@ -723,16 +798,27 @@ drop function if exists return_stock(uuid, numeric, text, text, text, text[]);
 -- t.request_id) show it — before this, every return showed "—" there even
 -- when staff had explicitly looked the request up, which is exactly the
 -- gap this closes.
+-- v4: adds p_unit_codes — when the return was collected by scanning
+-- numbered unit stickers one-by-one (js/app.js return-by-request "Scan
+-- units" mode) rather than typing a quantity, each code is validated and
+-- flipped back to in_stock here, in the same transaction as the qty
+-- movement. Only a unit actually issued under *this* request is accepted
+-- (issued_request_id must match p_request_id) — scanning some other
+-- request's unit, or one that was never issued, is rejected outright
+-- rather than silently accepted.
 create or replace function return_stock(
   p_sku_id uuid, p_qty numeric, p_uom text,
   p_returned_by text default null, p_note text default null,
-  p_image_paths text[] default null, p_request_id uuid default null
+  p_image_paths text[] default null, p_request_id uuid default null,
+  p_unit_codes text[] default null
 ) returns skus
 language plpgsql
 as $$
 declare
   v_sku skus;
   v_txn transactions;
+  v_unit_code text;
+  v_matched integer;
 begin
   if p_qty <= 0 then
     raise exception 'Quantity must be greater than zero';
@@ -752,6 +838,21 @@ begin
 
   perform insert_transaction_images(v_txn.id, p_image_paths);
 
+  if p_unit_codes is not null then
+    foreach v_unit_code in array p_unit_codes loop
+      update item_units
+      set status = 'returned', returned_transaction_id = v_txn.id
+      where unit_code = v_unit_code
+        and sku_id = p_sku_id
+        and status = 'issued'
+        and issued_request_id is not distinct from p_request_id;
+      get diagnostics v_matched = row_count;
+      if v_matched = 0 then
+        raise exception 'Unit % was not issued under this request (or has already been returned)', v_unit_code;
+      end if;
+    end loop;
+  end if;
+
   return v_sku;
 end;
 $$;
@@ -765,13 +866,20 @@ $$;
 -- but leaves a discrepancy record rather than silently accepting or
 -- blocking it.
 drop function if exists issue_stock(uuid, uuid, numeric, text);
+drop function if exists issue_stock(uuid, uuid, numeric, text, text[]);
 
--- v2 (current): adds p_image_paths, same reasoning as receive_stock above
--- — this one already captured the transaction row (v_txn), so it's just a
--- new param + one extra call.
+-- v2: adds p_image_paths, same reasoning as receive_stock above — this one
+-- already captured the transaction row (v_txn), so it's just a new param
+-- + one extra call.
+-- v3: adds p_unit_codes (units scanned one-by-one instead of a typed
+-- quantity — claimed against this request in the same transaction as the
+-- stock deduction below, never a second write) and p_shortfall_note (the
+-- "what happened" text captured when actual < requested via scanning,
+-- stored on the discrepancy row this function already creates for any
+-- mismatch — previously that row's notes column was always left null).
 create or replace function issue_stock(
   p_sku_id uuid, p_request_id uuid, p_actual_qty numeric, p_performed_by text default null,
-  p_image_paths text[] default null
+  p_image_paths text[] default null, p_shortfall_note text default null, p_unit_codes text[] default null
 ) returns jsonb
 language plpgsql
 as $$
@@ -781,6 +889,8 @@ declare
   v_txn transactions;
   v_discrepancy discrepancies;
   v_has_discrepancy boolean := false;
+  v_unit_code text;
+  v_matched integer;
 begin
   if p_actual_qty <= 0 then
     raise exception 'Quantity must be greater than zero';
@@ -822,10 +932,22 @@ begin
 
   perform insert_transaction_images(v_txn.id, p_image_paths);
 
+  if p_unit_codes is not null then
+    foreach v_unit_code in array p_unit_codes loop
+      update item_units
+      set status = 'issued', issued_request_id = p_request_id, issued_transaction_id = v_txn.id
+      where unit_code = v_unit_code and sku_id = p_sku_id and status = 'in_stock';
+      get diagnostics v_matched = row_count;
+      if v_matched = 0 then
+        raise exception 'Unit % is not available to issue (already issued/returned, or belongs to a different item)', v_unit_code;
+      end if;
+    end loop;
+  end if;
+
   if p_actual_qty <> v_request.qty_requested then
     v_has_discrepancy := true;
-    insert into discrepancies (transaction_id, request_id, requested_qty, actual_qty)
-    values (v_txn.id, p_request_id, v_request.qty_requested, p_actual_qty)
+    insert into discrepancies (transaction_id, request_id, requested_qty, actual_qty, notes)
+    values (v_txn.id, p_request_id, v_request.qty_requested, p_actual_qty, p_shortfall_note)
     returning * into v_discrepancy;
   end if;
 
@@ -1298,9 +1420,10 @@ $$;
 revoke execute on function insert_transaction_images(uuid, text[]) from public;
 revoke execute on function insert_sku_images(uuid, text[]) from public;
 revoke execute on function receive_stock(uuid, numeric, text, text, text, text[]) from public;
-revoke execute on function return_stock(uuid, numeric, text, text, text, text[], uuid) from public;
-revoke execute on function issue_stock(uuid, uuid, numeric, text, text[]) from public;
+revoke execute on function return_stock(uuid, numeric, text, text, text, text[], uuid, text[]) from public;
+revoke execute on function issue_stock(uuid, uuid, numeric, text, text[], text, text[]) from public;
 revoke execute on function create_sku(text, text, text, text, numeric, numeric, text[]) from public;
+revoke execute on function create_item_units(uuid, int, uuid) from public;
 revoke execute on function create_public_request(text, text, text, text, jsonb, text) from public;
 revoke execute on function next_request_code() from public;
 revoke execute on function create_authenticated_request(jsonb, text, date, text, text, text, text) from public;
@@ -1312,9 +1435,10 @@ revoke execute on function is_admin() from public;
 grant execute on function insert_transaction_images(uuid, text[]) to authenticated;
 grant execute on function insert_sku_images(uuid, text[]) to authenticated;
 grant execute on function receive_stock(uuid, numeric, text, text, text, text[]) to authenticated;
-grant execute on function return_stock(uuid, numeric, text, text, text, text[], uuid) to authenticated;
-grant execute on function issue_stock(uuid, uuid, numeric, text, text[]) to authenticated;
+grant execute on function return_stock(uuid, numeric, text, text, text, text[], uuid, text[]) to authenticated;
+grant execute on function issue_stock(uuid, uuid, numeric, text, text[], text, text[]) to authenticated;
 grant execute on function create_sku(text, text, text, text, numeric, numeric, text[]) to authenticated;
+grant execute on function create_item_units(uuid, int, uuid) to authenticated;
 grant execute on function create_public_request(text, text, text, text, jsonb, text) to anon, authenticated;
 grant execute on function next_request_code() to authenticated;
 grant execute on function create_authenticated_request(jsonb, text, date, text, text, text, text) to authenticated;
@@ -1357,6 +1481,8 @@ alter table buildings enable row level security;
 alter table work_areas enable row level security;
 alter table request_sequences enable row level security;
 alter table user_profiles enable row level security;
+alter table item_units enable row level security;
+alter table sku_unit_sequences enable row level security;
 
 -- user_profiles: everyone can read their own row (needed right after login
 -- just to know "who am I / what's my role" — see DB.getMyProfile() in
@@ -1542,6 +1668,16 @@ drop policy if exists "anon full access - sku_sequences" on sku_sequences;
 drop policy if exists "authenticated full access - sku_sequences" on sku_sequences;
 drop policy if exists "staff and admin full access - sku_sequences" on sku_sequences;
 create policy "staff and admin full access - sku_sequences" on sku_sequences for all to authenticated
+  using (is_staff_or_admin()) with check (is_staff_or_admin());
+
+-- item_units/sku_unit_sequences: same staff/admin-only boundary as
+-- transactions/lot_sequences above — a requester never scans or sees units.
+drop policy if exists "staff and admin full access - item_units" on item_units;
+create policy "staff and admin full access - item_units" on item_units for all to authenticated
+  using (is_staff_or_admin()) with check (is_staff_or_admin());
+
+drop policy if exists "staff and admin full access - sku_unit_sequences" on sku_unit_sequences;
+create policy "staff and admin full access - sku_unit_sequences" on sku_unit_sequences for all to authenticated
   using (is_staff_or_admin()) with check (is_staff_or_admin());
 
 -- request_sequences: unchanged — both anon (create_public_request) and
