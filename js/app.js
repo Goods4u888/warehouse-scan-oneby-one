@@ -3223,6 +3223,17 @@ async function initApp() {
     await refreshAuthUi();
     return;
   }
+  if (!currentProfile.is_active) {
+    // Manage Staff's "Deactivate" sets this — is_staff_or_admin()/is_admin()
+    // in schema.sql now also check it, so RLS already refuses this person
+    // everything; signing them straight back out here just makes that
+    // visible instead of leaving them staring at a blank/broken screen.
+    appBooted = false;
+    toast(t('errorAccountDeactivated'), 'error');
+    await Auth.signOut();
+    await refreshAuthUi();
+    return;
+  }
   applyRoleGate(currentProfile.role);
   try {
     activeSkus = await DB.listSkus({ activeOnly: true });

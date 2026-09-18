@@ -1400,11 +1400,18 @@ drop function if exists find_auth_user_id(text);
 -- table and so bypasses its RLS entirely, same reasoning as
 -- create_public_request()'s security definer above — reads the row
 -- directly with no policy evaluation at all, breaking the cycle.
+-- v2: adds "and is_active" -- without it, Manage Staff's "Deactivate"
+-- button only hid someone from the active list; it never actually revoked
+-- their database access, since every staff/admin RPC and RLS policy in
+-- this file gates purely on role through this function. A deactivated
+-- person's existing session (or a re-entered password) could still call
+-- every staff/admin operation directly. See also initApp() in app.js,
+-- which now signs a deactivated caller straight back out on login.
 create or replace function is_staff_or_admin() returns boolean
 language sql stable security definer
 set search_path = public
 as $$
-  select exists (select 1 from user_profiles where id = auth.uid() and role in ('staff','admin'));
+  select exists (select 1 from user_profiles where id = auth.uid() and role in ('staff','admin') and is_active);
 $$;
 
 -- Same reasoning as is_staff_or_admin() above, and used the same way by
@@ -1413,11 +1420,12 @@ $$;
 -- infinite-recursion error, since (unlike is_staff_or_admin(), only ever
 -- used on *other* tables) it's what user_profiles' own policies use to
 -- check the caller against user_profiles itself.
+-- v2: adds "and is_active", same reasoning as is_staff_or_admin() above.
 create or replace function is_admin() returns boolean
 language sql stable security definer
 set search_path = public
 as $$
-  select exists (select 1 from user_profiles where id = auth.uid() and role = 'admin');
+  select exists (select 1 from user_profiles where id = auth.uid() and role = 'admin' and is_active);
 $$;
 
 -- Postgres grants EXECUTE on a new function to PUBLIC by default — revoking

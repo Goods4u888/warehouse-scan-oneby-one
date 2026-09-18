@@ -228,6 +228,7 @@ const I18N = {
     errorLoginFailed: 'Incorrect email or password',
     loggingIn: 'Logging in…',
     errorNoProfile: 'Your account has no profile yet — ask an admin to add you in Manage Staff.',
+    errorAccountDeactivated: 'This account has been deactivated — ask an admin to reactivate it in Manage Staff.',
 
     // Roles (user_profiles.role)
     roleRequester: 'Requester',
@@ -538,6 +539,7 @@ const I18N = {
     errorLoginFailed: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง',
     loggingIn: 'กำลังเข้าสู่ระบบ…',
     errorNoProfile: 'บัญชีนี้ยังไม่มีโปรไฟล์ — กรุณาให้ผู้ดูแลระบบเพิ่มชื่อคุณในหน้าจัดการบัญชีผู้ใช้',
+    errorAccountDeactivated: 'บัญชีนี้ถูกปิดใช้งานแล้ว — กรุณาให้ผู้ดูแลระบบเปิดใช้งานอีกครั้งในหน้าจัดการบัญชีผู้ใช้',
 
     // Roles (user_profiles.role)
     roleRequester: 'ผู้ขอเบิก',
