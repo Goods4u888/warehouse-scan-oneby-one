@@ -3041,10 +3041,10 @@ function resetManageStaffForm() {
 // Shown once, right after a brand-new login is created — a toast isn't
 // enough here since the admin needs time to copy the password before it's
 // gone for good (the server never stores or shows it again).
-function staffCredentialsHtml(email, password) {
+function staffCredentialsHtml(email, password, title) {
   return `
     <div class="card">
-      <p class="card-title">${t('staffCredentialsTitle')}</p>
+      <p class="card-title">${title || t('staffCredentialsTitle')}</p>
       <p class="card-meta">${escapeHtml(email)}</p>
       <div class="field-with-btn" style="margin-top:var(--s2)">
         <input type="text" id="ms-credentials-password" value="${escapeHtml(password)}" readonly>
@@ -3058,9 +3058,9 @@ function staffCredentialsHtml(email, password) {
   `;
 }
 
-function showStaffCredentials(email, password) {
+function showStaffCredentials(email, password, title) {
   const box = document.getElementById('ms-credentials');
-  box.innerHTML = staffCredentialsHtml(email, password);
+  box.innerHTML = staffCredentialsHtml(email, password, title);
   box.hidden = false;
   document.getElementById('form-manage-staff').hidden = true;
   document.getElementById('ms-credentials-copy').addEventListener('click', () => {
@@ -3143,6 +3143,21 @@ function renderManageStaffLists() {
   document.querySelectorAll('[data-ms-toggle]').forEach((btn) => {
     btn.addEventListener('click', () => toggleStaffActive(btn.dataset.msToggle, btn.dataset.toActive === 'true'));
   });
+  document.querySelectorAll('[data-ms-reset]').forEach((btn) => {
+    btn.addEventListener('click', () => onResetStaffPassword(btn.dataset.msReset));
+  });
+}
+
+async function onResetStaffPassword(id) {
+  const s = msAllStaff.find((x) => x.id === id);
+  if (!s) return;
+  if (!confirm(t('confirmResetPassword', s.name))) return;
+  try {
+    const result = await DB.resetStaffPassword(id);
+    showStaffCredentials(result.email || s.name, result.generated_password, t('passwordResetTitle'));
+  } catch (err) {
+    toast(err.message || 'Could not reset password', 'error');
+  }
 }
 
 function msRowHtml(s) {
@@ -3156,6 +3171,7 @@ function msRowHtml(s) {
       </div>
       <div class="card-row" style="margin-top:var(--s3)">
         <button class="btn btn-outline btn-sm" data-ms-edit="${s.id}">${icon('pencil', 14)}<span>${t('btnEdit')}</span></button>
+        ${s.is_active ? `<button class="btn btn-outline btn-sm" data-ms-reset="${s.id}">${icon('repeat', 14)}<span>${t('btnResetPassword')}</span></button>` : ''}
         ${s.is_active
           ? `<button class="btn btn-ghost btn-sm" data-ms-toggle="${s.id}" data-to-active="false">${icon('xCircle', 14)}<span>${t('btnDeactivate')}</span></button>`
           : `<button class="btn btn-ghost btn-sm" data-ms-toggle="${s.id}" data-to-active="true">${icon('checkCircle', 14)}<span>${t('btnActivate')}</span></button>`}

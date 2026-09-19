@@ -90,6 +90,26 @@ const DB = {
     return data;
   },
 
+  // Sets a brand-new random password for an existing login, server-side via
+  // the reset-staff-password Edge Function — this app's @warehouse.local
+  // addresses have no real inbox, so the Dashboard's own email-based
+  // "Reset password" can never actually reach anyone. Returns
+  // { generated_password }, shown once by showStaffCredentials() in app.js.
+  async resetStaffPassword(userId) {
+    const { data, error } = await supabaseClient.functions.invoke('reset-staff-password', {
+      body: { userId },
+    });
+    if (error) {
+      let msg = error.message;
+      try {
+        const body = await error.context.json();
+        if (body?.error) msg = body.error;
+      } catch (_) { /* not JSON, or already consumed */ }
+      throw new Error(msg);
+    }
+    return data;
+  },
+
   // id must already exist as a Supabase Auth user — this only
   // inserts/updates their profile row (used for editing an existing
   // person; new people go through createStaffLogin above).
