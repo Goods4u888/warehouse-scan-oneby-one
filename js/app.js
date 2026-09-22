@@ -1149,7 +1149,8 @@ document.getElementById('btn-rt-lookup-request').addEventListener('click', async
       name: tx.skus?.name || '',
       skuCode: tx.skus?.sku_code || '',
       baseUom: tx.skus?.base_uom || tx.uom,
-      issuedQty: tx.qty,
+      issuedQty: tx.qty, // remaining returnable — already returned amounts are subtracted (DB.listIssuedItemsForRequest)
+      originalIssuedQty: tx.issuedQty,
       returnQty: tx.qty,
       mode: 'manual', // 'manual' (typed qty) or 'scan' (scan back the numbered units issued for this request)
       scannedUnits: [],
@@ -1189,6 +1190,7 @@ function returnByRequestRowHtml(row) {
     <div class="card" style="margin-bottom:var(--s3)">
       <div class="card-title">${escapeHtml(row.name)}</div>
       <div class="card-meta mono">${escapeHtml(row.skuCode)}</div>
+      ${row.originalIssuedQty > row.issuedQty ? `<p class="field-hint">${t('hintAlreadyReturned', fmtQty(row.originalIssuedQty - row.issuedQty), fmtQty(row.originalIssuedQty), escapeHtml(row.baseUom))}</p>` : ''}
       <div class="segmented rtreq-mode-tabs" data-id="${row.txnId}" role="tablist" style="margin-top:var(--s3)">
         <button type="button" data-mode="manual" aria-pressed="${row.mode === 'manual'}">${t('scanModeManual')}</button>
         <button type="button" data-mode="scan" aria-pressed="${row.mode === 'scan'}">${t('scanModeUnits')}</button>

@@ -435,7 +435,16 @@ const DB = {
   // guessing at embedded-resource filter syntax for an occasional lookup,
   // not a hot path. Returns { meta, items: [] } — meta is null and items
   // empty if the code doesn't exist or nothing was ever issued against it
-  // (a request that's still pending, e.g.).
+  // (a request that's still pending, e.g.), or if everything issued has
+  // already been fully returned.
+  //
+  // Each item's qty is the REMAINING returnable amount, not the original
+  // issued amount: prior 'return' transactions against the same
+  // request+SKU are subtracted here before the row ever reaches the UI.
+  // Without this, re-looking-up a request after a partial return kept
+  // showing the full original issued qty as returnable every time — no
+  // memory of what had already come back — so staff could return the same
+  // line over and over, inflating qty_on_hand past what was ever issued.
   async listIssuedItemsForRequest(code) {
     const { data: reqs, error: reqErr } = await supabaseClient
       .from('requests')
@@ -450,7 +459,24 @@ const DB = {
       .eq('type', 'issue')
       .in('request_id', ids);
     if (txErr) throw txErr;
-    return { meta: reqs[0], items: txns };
+    const { data: returns, error: retErr } = await supabaseClient
+      .from('transactions')
+      .select('sku_id, qty, request_id')
+      .eq('type', 'return')
+      .in('request_id', ids);
+    if (retErr) throw retErr;
+    const returnedByKey = {};
+    (returns || []).forEach((r) => {
+      const key = `${r.request_id}:${r.sku_id}`;
+      returnedByKey[key] = (returnedByKey[key] || 0) + Number(r.qty);
+    });
+    const items = (txns || [])
+      .map((tx) => {
+        const alreadyReturned = returnedByKey[`${tx.request_id}:${tx.sku_id}`] || 0;
+        return { ...tx, issuedQty: Number(tx.qty), qty: Math.max(0, Number(tx.qty) - alreadyReturned) };
+      })
+      .filter((tx) => tx.qty > 0);
+    return { meta: reqs[0], items };
   },
 
   async listRequests({ status = null } = {}) {
