@@ -479,7 +479,13 @@ const DB = {
     return { meta: reqs[0], items };
   },
 
-  async listRequests({ status = null } = {}) {
+  // withReturnStatus: attaches r.returnStatus ('none'/'partial'/'full') per
+  // row, computed from the ledger — requests.status has no 'returned'
+  // value (a line can be fully issued, then only partly returned, which
+  // one status enum can't represent). Costs one extra query, so it's
+  // opt-in: only the Requests list view needs it; onItemScanned()'s
+  // open-requests lookup and the Reports raw-rows export don't.
+  async listRequests({ status = null, withReturnStatus = false } = {}) {
     // approver:user_profiles!approved_by(name) — explicit FK hint since
     // requests has two FKs into user_profiles (approved_by and
     // requester_user_id); without naming which one, PostgREST can't tell
@@ -491,7 +497,26 @@ const DB = {
     if (status) q = q.eq('status', status);
     const { data, error } = await q;
     if (error) throw error;
-    return data;
+    if (!withReturnStatus || !data.length) return data;
+
+    const ids = data.map((r) => r.id);
+    const { data: txns, error: txErr } = await supabaseClient
+      .from('transactions')
+      .select('request_id, type, qty')
+      .in('request_id', ids)
+      .in('type', ['issue', 'return']);
+    if (txErr) throw txErr;
+    const issuedByReq = {};
+    const returnedByReq = {};
+    (txns || []).forEach((t) => {
+      const bucket = t.type === 'issue' ? issuedByReq : returnedByReq;
+      bucket[t.request_id] = (bucket[t.request_id] || 0) + Number(t.qty);
+    });
+    return data.map((r) => {
+      const issued = issuedByReq[r.id] || 0;
+      const returned = returnedByReq[r.id] || 0;
+      return { ...r, returnStatus: returned <= 0 ? 'none' : returned >= issued ? 'full' : 'partial' };
+    });
   },
 
   // Used by both the Requester role's own "new request" form and

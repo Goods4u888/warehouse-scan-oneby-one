@@ -2198,7 +2198,7 @@ async function loadRequests() {
   const list = document.getElementById('requests-list');
   list.innerHTML = skeletonCards(3);
   try {
-    requestRows = await DB.listRequests({ status: requestStatus === 'all' ? null : requestStatus });
+    requestRows = await DB.listRequests({ status: requestStatus === 'all' ? null : requestStatus, withReturnStatus: true });
     renderRequestsList();
   } catch (err) {
     list.innerHTML = '';
@@ -2248,9 +2248,13 @@ function renderRequestsList() {
           <div class="card-title">${title}</div>
           <div class="card-meta">${meta}</div>
         </div>
-        ${r.status === 'fulfilled' && r.staff_note
-          ? `<span class="chip chip-low">${t('chipNotDelivered')}</span>`
-          : `<span class="chip ${statusChipClass(r.status)}">${statusLabel(r.status)}</span>`}
+        <div style="display:flex;flex-direction:column;gap:var(--s1);align-items:flex-end">
+          ${r.status === 'fulfilled' && r.staff_note
+            ? `<span class="chip chip-low">${t('chipNotDelivered')}</span>`
+            : `<span class="chip ${statusChipClass(r.status)}">${statusLabel(r.status)}</span>`}
+          ${r.returnStatus === 'full' ? `<span class="chip chip-neutral">${t('chipReturnedFull')}</span>` : ''}
+          ${r.returnStatus === 'partial' ? `<span class="chip chip-neutral">${t('chipReturnedPartial')}</span>` : ''}
+        </div>
       </div>
       ${r.work_area ? `<div class="card-meta" style="margin-top:var(--s2)">${icon('mapPin', 12)} ${escapeHtml(r.work_area)}</div>` : ''}
       ${r.notes ? `<div class="card-meta" style="margin-top:var(--s2)">${escapeHtml(r.notes)}</div>` : ''}
